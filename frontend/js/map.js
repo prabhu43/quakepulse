@@ -78,6 +78,7 @@ const QuakeMap = (() => {
             attribution: TILES.dark.attribution,
             subdomains: 'abcd',
             maxZoom: 18,
+            noWrap: true,
         }).addTo(map);
 
         markersLayer = L.markerClusterGroup({
@@ -167,6 +168,7 @@ const QuakeMap = (() => {
             attribution: tile.attribution,
             subdomains: 'abcd',
             maxZoom: 18,
+            noWrap: true,
         }).addTo(map);
     }
 
