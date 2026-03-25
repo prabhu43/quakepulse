@@ -2,8 +2,9 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.config import settings
@@ -28,16 +29,32 @@ async def lifespan(app: FastAPI):
     # --- Startup ---
     logger.info("Starting QuakePulse...")
 
-    # Initialize services
+    # Initialize core services (DB is required, others are best-effort)
     await init_db()
-    await cache.init_valkey()
-    await init_producer()
-    await init_consumer()
+
+    try:
+        await cache.init_valkey()
+    except Exception:
+        logger.exception("Valkey init failed — caching/pub-sub will be unavailable")
+
+    try:
+        await init_producer()
+    except Exception:
+        logger.exception("Kafka producer init failed — data ingestion will be unavailable")
+
+    try:
+        await init_consumer()
+    except Exception:
+        logger.exception("Kafka consumer init failed — data processing will be unavailable")
 
     # Start background tasks
     _bg_tasks.append(asyncio.create_task(seed_and_poll()))
     _bg_tasks.append(asyncio.create_task(consume_loop()))
-    await start_subscriber()
+
+    try:
+        await start_subscriber()
+    except Exception:
+        logger.exception("Valkey subscriber start failed — live updates will be unavailable")
 
     logger.info("QuakePulse started successfully")
     yield
@@ -71,6 +88,15 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    logger.exception(f"Unhandled error on {request.method} {request.url.path}")
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error"},
+    )
 
 app.add_middleware(
     CORSMiddleware,

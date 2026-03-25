@@ -124,6 +124,8 @@
         const label = liveIndicator.querySelector('.label');
         if (status === 'connected') {
             label.textContent = 'Live';
+        } else if (status === 'polling') {
+            label.textContent = 'Polling';
         } else {
             label.textContent = 'Reconnecting...';
         }

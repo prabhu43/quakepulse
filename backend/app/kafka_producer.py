@@ -1,9 +1,11 @@
 import asyncio
 import json
 import logging
+import time
 
 import httpx
 from aiokafka import AIOKafkaProducer
+from aiokafka.errors import KafkaConnectionError, KafkaError
 
 from app.config import settings
 
@@ -21,6 +23,12 @@ TOPIC_ALERTS = "quake-alerts"
 _producer: AIOKafkaProducer | None = None
 _seen_ids: set[str] = set()
 MAX_SEEN_IDS = 5000
+
+# --- Circuit breaker state ---
+_circuit_failures: int = 0
+CIRCUIT_FAILURE_THRESHOLD = 5
+CIRCUIT_RESET_TIMEOUT = 60  # seconds
+_circuit_open_until: float = 0
 
 
 def _parse_feature(feature: dict) -> dict | None:
@@ -52,17 +60,31 @@ def _parse_feature(feature: dict) -> dict | None:
     }
 
 
-async def init_producer():
+async def init_producer(max_retries: int = 5):
     global _producer
-    _producer = AIOKafkaProducer(
-        bootstrap_servers=settings.kafka_bootstrap_servers,
-        security_protocol="SSL",
-        ssl_context=settings.kafka_ssl_context(),
-        value_serializer=lambda v: json.dumps(v).encode("utf-8"),
-        key_serializer=lambda k: k.encode("utf-8") if k else None,
-    )
-    await _producer.start()
-    logger.info("Kafka producer started")
+    for attempt in range(1, max_retries + 1):
+        try:
+            _producer = AIOKafkaProducer(
+                bootstrap_servers=settings.kafka_bootstrap_servers,
+                security_protocol="SSL",
+                ssl_context=settings.kafka_ssl_context(),
+                value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+                key_serializer=lambda k: k.encode("utf-8") if k else None,
+                request_timeout_ms=15000,
+                retry_backoff_ms=500,
+            )
+            await _producer.start()
+            logger.info("Kafka producer started")
+            return
+        except (KafkaConnectionError, KafkaError, OSError) as exc:
+            logger.warning(
+                f"Kafka producer connect attempt {attempt}/{max_retries} failed: {exc}"
+            )
+            _producer = None
+            if attempt < max_retries:
+                delay = min(2 ** attempt, 30)
+                await asyncio.sleep(delay)
+    logger.error("Kafka producer failed to start after all retries")
 
 
 async def stop_producer():
@@ -72,30 +94,76 @@ async def stop_producer():
         logger.info("Kafka producer stopped")
 
 
+def _is_circuit_open() -> bool:
+    return _circuit_failures >= CIRCUIT_FAILURE_THRESHOLD and time.time() < _circuit_open_until
+
+
+def _record_circuit_failure():
+    global _circuit_failures, _circuit_open_until
+    _circuit_failures += 1
+    if _circuit_failures >= CIRCUIT_FAILURE_THRESHOLD:
+        _circuit_open_until = time.time() + CIRCUIT_RESET_TIMEOUT
+        logger.warning(
+            f"Circuit breaker OPEN — suppressing Kafka sends for {CIRCUIT_RESET_TIMEOUT}s"
+        )
+
+
+def _record_circuit_success():
+    global _circuit_failures, _circuit_open_until
+    if _circuit_failures > 0:
+        _circuit_failures = 0
+        _circuit_open_until = 0
+
+
 async def _produce_quake(quake: dict):
     if _producer is None:
+        logger.debug("Kafka producer not initialized — skipping produce")
+        return
+
+    if _is_circuit_open():
+        logger.debug("Circuit breaker open — skipping produce")
         return
 
     quake_id = quake["id"]
     mag = quake.get("magnitude") or 0
     tsunami = quake.get("tsunami", 0)
 
-    await _producer.send_and_wait(TOPIC_RAW, value=quake, key=quake_id)
+    try:
+        await _producer.send_and_wait(TOPIC_RAW, value=quake, key=quake_id)
 
-    if mag >= 4.5:
-        await _producer.send_and_wait(TOPIC_SIGNIFICANT, value=quake, key=quake_id)
+        if mag >= 4.5:
+            await _producer.send_and_wait(TOPIC_SIGNIFICANT, value=quake, key=quake_id)
 
-    if mag >= 6.0 or tsunami == 1:
-        await _producer.send_and_wait(TOPIC_ALERTS, value=quake, key=quake_id)
+        if mag >= 6.0 or tsunami == 1:
+            await _producer.send_and_wait(TOPIC_ALERTS, value=quake, key=quake_id)
+
+        _record_circuit_success()
+    except (KafkaConnectionError, KafkaError) as exc:
+        _record_circuit_failure()
+        logger.error(f"Kafka produce failed for {quake_id}: {exc}")
 
 
-async def _fetch_and_produce(feed_url: str):
+async def _fetch_and_produce(feed_url: str, retries: int = 3):
     global _seen_ids
 
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.get(feed_url)
-        resp.raise_for_status()
-        data = resp.json()
+    last_exc: Exception | None = None
+    for attempt in range(1, retries + 1):
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.get(feed_url)
+                resp.raise_for_status()
+                data = resp.json()
+            break
+        except (httpx.HTTPStatusError, httpx.RequestError) as exc:
+            last_exc = exc
+            logger.warning(
+                f"USGS fetch attempt {attempt}/{retries} failed for {feed_url}: {exc}"
+            )
+            if attempt < retries:
+                await asyncio.sleep(min(2 ** attempt, 15))
+    else:
+        logger.error(f"USGS fetch failed after {retries} retries: {last_exc}")
+        return
 
     features = data.get("features", [])
     new_count = 0

@@ -3,6 +3,7 @@ import logging
 import time
 
 import redis.asyncio as redis
+from redis.exceptions import RedisError
 
 from app.config import settings
 
@@ -19,8 +20,20 @@ STATS_TTL = 60
 
 async def init_valkey():
     global _client, _pubsub_client
-    _client = redis.from_url(settings.valkey_uri, decode_responses=True)
-    _pubsub_client = redis.from_url(settings.valkey_uri, decode_responses=True)
+    _client = redis.from_url(
+        settings.valkey_uri,
+        decode_responses=True,
+        socket_connect_timeout=10,
+        socket_timeout=5,
+        retry_on_timeout=True,
+    )
+    _pubsub_client = redis.from_url(
+        settings.valkey_uri,
+        decode_responses=True,
+        socket_connect_timeout=10,
+        socket_timeout=5,
+        retry_on_timeout=True,
+    )
     await _client.ping()
     logger.info("Valkey connected")
 
@@ -35,12 +48,14 @@ async def close_valkey():
 
 
 def get_client() -> redis.Redis:
-    assert _client is not None, "Valkey not initialized"
+    if _client is None:
+        raise RedisError("Valkey not initialized")
     return _client
 
 
 def get_pubsub_client() -> redis.Redis:
-    assert _pubsub_client is not None, "Valkey pubsub client not initialized"
+    if _pubsub_client is None:
+        raise RedisError("Valkey pubsub client not initialized")
     return _pubsub_client
 
 

@@ -13,47 +13,88 @@ router = APIRouter()
 class ConnectionManager:
     def __init__(self):
         self.active: list[WebSocket] = []
+        self._lock = asyncio.Lock()
 
     async def connect(self, ws: WebSocket):
         await ws.accept()
-        self.active.append(ws)
+        async with self._lock:
+            self.active.append(ws)
         logger.info(f"WebSocket connected. Total: {len(self.active)}")
 
-    def disconnect(self, ws: WebSocket):
-        self.active.remove(ws)
+    async def disconnect(self, ws: WebSocket):
+        async with self._lock:
+            try:
+                self.active.remove(ws)
+            except ValueError:
+                pass
         logger.info(f"WebSocket disconnected. Total: {len(self.active)}")
 
     async def broadcast(self, message: str):
+        async with self._lock:
+            clients = list(self.active)
+
         disconnected = []
-        for ws in self.active:
+        for ws in clients:
             try:
                 await ws.send_text(message)
             except Exception:
                 disconnected.append(ws)
-        for ws in disconnected:
-            self.active.remove(ws)
+
+        if disconnected:
+            async with self._lock:
+                for ws in disconnected:
+                    try:
+                        self.active.remove(ws)
+                    except ValueError:
+                        pass
 
 
 manager = ConnectionManager()
 
 
 async def _valkey_subscriber():
-    """Background task: subscribe to Valkey pub/sub and broadcast to WebSocket clients."""
-    pubsub_client = cache.get_pubsub_client()
-    pubsub = pubsub_client.pubsub()
-    await pubsub.subscribe("live-quakes")
-    logger.info("Valkey pub/sub subscriber started")
+    """Background task: subscribe to Valkey pub/sub and broadcast to WebSocket clients.
 
-    try:
-        async for message in pubsub.listen():
-            if message["type"] == "message":
-                await manager.broadcast(message["data"])
-    except asyncio.CancelledError:
-        await pubsub.unsubscribe("live-quakes")
-        await pubsub.aclose()
-        logger.info("Valkey pub/sub subscriber stopped")
-    except Exception:
-        logger.exception("Valkey pub/sub subscriber error")
+    Automatically reconnects on connection failure with exponential backoff.
+    """
+    reconnect_delay = 1
+    max_reconnect_delay = 60
+
+    while True:
+        pubsub = None
+        pubsub_client = None
+        try:
+            pubsub_client = cache.get_pubsub_client()
+            pubsub = pubsub_client.pubsub()
+            await pubsub.subscribe("live-quakes")
+            logger.info("Valkey pub/sub subscriber started")
+            reconnect_delay = 1  # reset on successful connection
+
+            async for message in pubsub.listen():
+                if message["type"] == "message":
+                    await manager.broadcast(message["data"])
+
+        except asyncio.CancelledError:
+            if pubsub:
+                try:
+                    await pubsub.unsubscribe("live-quakes")
+                    await pubsub.aclose()
+                except Exception:
+                    pass
+            logger.info("Valkey pub/sub subscriber stopped")
+            return
+        except Exception:
+            logger.exception(
+                f"Valkey pub/sub subscriber error, reconnecting in {reconnect_delay}s..."
+            )
+            if pubsub:
+                try:
+                    await pubsub.unsubscribe("live-quakes")
+                    await pubsub.aclose()
+                except Exception:
+                    pass
+            await asyncio.sleep(reconnect_delay)
+            reconnect_delay = min(reconnect_delay * 2, max_reconnect_delay)
 
 
 _subscriber_task: asyncio.Task | None = None
@@ -79,7 +120,11 @@ async def websocket_live(ws: WebSocket):
     await manager.connect(ws)
     try:
         # Send recent earthquakes as initial payload
-        recent = await cache.get_recent_cached(limit=20)
+        try:
+            recent = await cache.get_recent_cached(limit=20)
+        except Exception:
+            logger.warning("Failed to fetch recent cache for WS initial payload")
+            recent = []
         await ws.send_text(json.dumps({"type": "initial", "data": recent}))
 
         # Keep connection alive, listen for client messages (e.g., pings)
@@ -89,6 +134,7 @@ async def websocket_live(ws: WebSocket):
             if data == "ping":
                 await ws.send_text(json.dumps({"type": "pong"}))
     except WebSocketDisconnect:
-        manager.disconnect(ws)
+        await manager.disconnect(ws)
     except Exception:
-        manager.disconnect(ws)
+        logger.debug("WebSocket connection closed unexpectedly")
+        await manager.disconnect(ws)
