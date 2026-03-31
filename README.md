@@ -2,6 +2,8 @@
 
 > A real-time earthquake monitoring dashboard that streams USGS earthquake data through **Aiven Kafka**, stores it in **Aiven PostgreSQL**, caches hot data in **Aiven Valkey**, and displays everything on a live interactive map with WebSocket-powered updates.
 
+**Live Demo:** [https://quakepulse.onrender.com](https://quakepulse.onrender.com/)
+
 Built for the [Aiven Free Tier Competition](https://aiven.io/blog/the-aiven-free-tier-competition) `#AivenFreeTier`
 
 ![QuakePulse Dashboard](assets/dashboard.png)
