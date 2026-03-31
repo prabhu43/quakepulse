@@ -1,0 +1,28 @@
+# render.yaml — Render Infrastructure-as-Code Blueprint
+# Deploy with: connect GitHub repo on Render dashboard, or use `render blueprint launch`
+
+services:
+  - type: web
+    name: quakepulse
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /api/health
+    envVars:
+      # Aiven PostgreSQL connection URI
+      - key: PG_URI
+        sync: false
+      # Aiven Kafka
+      - key: KAFKA_BOOTSTRAP_SERVERS
+        sync: false
+      # Aiven Valkey connection URI
+      - key: VALKEY_URI
+        sync: false
+      # Kafka SSL certs (paste full PEM content as env vars)
+      - key: KAFKA_CA_CERT
+        sync: false
+      - key: KAFKA_SERVICE_CERT
+        sync: false
+      - key: KAFKA_SERVICE_KEY
+        sync: false
