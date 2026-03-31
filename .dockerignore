@@ -1,0 +1,12 @@
+__pycache__
+*.pyc
+*.pyo
+.env
+.git
+.gitignore
+.venv
+venv
+*.md
+backend/certs/*.key
+backend/certs/*.pem
+backend/certs/*.cert

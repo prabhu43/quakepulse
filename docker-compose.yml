@@ -1,0 +1,13 @@
+services:
+  quakepulse:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    env_file:
+      - backend/.env
+    volumes:
+      # Mount Kafka SSL certificates into the container
+      - ./backend/certs:/app/backend/certs:ro
+    restart: unless-stopped
